@@ -24,7 +24,7 @@ def load_data():
 # --- 2. UI DEFINITION ---
 
 app_ui = ui.page_fluid(
-    ui.panel_title("The Outlier Excluder"),
+    ui.panel_title("Sean's Outlier Excluder"),
     
     ui.layout_sidebar(
         ui.sidebar(
