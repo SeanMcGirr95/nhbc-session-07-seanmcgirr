@@ -38,7 +38,6 @@ elif PROVIDER == 'azure':
     MODEL = "gpt-4o" # or your deployment name
 
 
-
 # TODO: Define your System Prompt here
 # TODO: Our example code assumes a JSON response; you can do something different if you want.
 SYSTEM_PROMPT = """
