@@ -60,6 +60,7 @@ Example JSON Output: {"FloodRisk": "High", "Construction": "Timber Frame", "Loca
 If the user asks to reset or show all, return an empty JSON object: {}
 """
 
+
 app_ui = ui.page_fluid(
     ui.h2("AI Property Filter"),
     
