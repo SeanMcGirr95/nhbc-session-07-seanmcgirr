@@ -1,0 +1,824 @@
+---
+title: "NHBC Reserving Example"
+format:
+  html:
+    code-fold: show
+    code-tools: true
+    number-sections: true
+    toc: true
+    toc-location: body
+    title-block-banner: true
+---
+
+# Introduction
+
+This document walks through a complete reserving workflow using NHBC's own data.
+
+The data in Snowflake is not complete or fully validated yet. We have taken the ‘ClaimsData’ table from the NHBC Reserving database and uploaded it.
+
+This table already has some data processing applied to it (including splitting it into capped and excess) and we have the query (currently in SQL code) to get to the manipulated data we use in our reserving models. 
+
+As part of our planned development work in Reserving, we would like to be able to get to this data directly from the tables already in Snowflake. However, this is a process that is currently owned and run by the Data team and we haven’t yet had chance to work through these steps.
+
+The data is available in `TEAM_SANDBOX.ACTUARIAL_RESERVING.CLAIMSDATA`.
+
+The SQL query is shared as:
+
+```python
+if category == "Capped":
+    sql_query = f"""
+    SELECT c.Period,
+           c.ReservingSegmentationGroup_Capped AS ReservingSegmentationGroup,
+           c.UWY,
+           c.FirstNotifiedFY,
+           c.FirstNotifiedFYQuarter,
+           c.ProcessingQuarter,
+           SUM(c.ClaimCount) AS ClaimCount,
+           SUM(c.Paid_Capped) AS Paid,
+           SUM(c.CaseIncurred_Capped) AS Incurred,
+           SUM(c.BuilderRecs_Capped) AS BuilderRecs
+    FROM datastore.ClaimsData c
+    WHERE c.Period = {xlPeriod.value}
+      AND c.isExcludedReserving = 0
+      AND c.UWY >= {xlUWYStart.value}
+      AND c.ReservingSegmentationGroup_Capped = '{xlSegClass.value}'
+      AND (
+             c.ValidityIndicator = 'Y'
+          OR c.Paid_Capped <> 0
+          OR c.CaseIncurred_Capped <> 0
+          OR c.BuilderRecs_Capped <> 0
+      )
+    GROUP BY c.Period, c.ReservingSegmentationGroup_Capped, c.UWY,
+             c.FirstNotifiedFY, c.FirstNotifiedFYHalfYear, c.FirstNotifiedFYQuarter,
+             c.FirstNotifiedMonth, c.ProcessingHalfYear, c.ProcessingQuarter, c.ProcessingMonth
+    """
+else:
+    sql_query = f"""
+    SELECT c.Period,
+           c.ReservingSegmentationGroup_Excess AS ReservingSegmentationGroup,
+           c.UWY,
+           c.FirstNotifiedFY,
+           c.FirstNotifiedFYQuarter,
+           c.ProcessingQuarter,
+           SUM(c.ClaimCount_Excess) AS ClaimCount,
+           SUM(c.Paid_Excess) AS Paid,
+           SUM(c.CaseIncurred_Excess) AS Incurred,
+           SUM(c.BuilderRecs_Excess) AS BuilderRecs
+    FROM datastore.ClaimsData c
+    WHERE c.Period = {xlPeriod.value}
+      AND c.isExcludedReserving = 0
+      AND c.UWY >= {xlUWYStart.value}
+      AND c.ReservingSegmentationGroup_Excess = '{xlSegClass.value}'
+      AND (
+             c.ValidityIndicator = 'Y'
+          OR c.Paid_Excess <> 0
+          OR c.CaseIncurred_Excess <> 0
+          OR c.BuilderRecs_Excess <> 0
+      )
+    GROUP BY c.Period, c.ReservingSegmentationGroup_Excess, c.UWY,
+             c.FirstNotifiedFY, c.FirstNotifiedFYHalfYear, c.FirstNotifiedFYQuarter,
+             c.FirstNotifiedMonth, c.ProcessingHalfYear, c.ProcessingQuarter, c.ProcessingMonth
+    """
+```
+
+# Selecting data
+
+We will connect to the database and replicate the logic of the SQL query.
+
+```{python}
+#| label: import-and-init
+import polars as pl
+from snowflake.snowpark import Session
+import snowflake.snowpark.functions as f
+import plotly.express as px
+
+## For working with Quarto documents
+from IPython.display import Markdown, display
+import itables
+itables.init_notebook_mode()
+```
+
+
+```{python}
+#! label: init-claims-data
+session = Session.builder.config("connection_name", "workbench").create()
+
+table_name = "TEAM_SANDBOX.ACTUARIAL_RESERVING.CLAIMSDATA"
+session.use_database("TEAM_SANDBOX")
+session.use_schema("ACTUARIAL_RESERVING")
+
+claims_data = session.table(table_name)
+```
+
+## Identify last available period
+
+```{python}
+last_period = claims_data.select(f.max("Period")).collect()[0][0]
+print(last_period)
+```
+
+We will simply **use the last available period** for all our calculations. In this run, that period is `{python} last_period`.
+
+For production reports, you may want to make this [a parameter](https://quarto.org/docs/computations/parameters.html#jupyter).
+
+## Limit to last period and globally exclude based on `isExcludedReserving`
+
+We also globally exclude rows where `isExcludedReserving` is not zero.
+
+```{python}
+#| label: claims-data-common-filter
+claims_data = (
+    claims_data.
+    filter(
+        (f.col("Period") == last_period) &
+        (f.col("isExcludedReserving") == 0)
+    )
+)
+claims_data.count()
+```
+
+## Sanity check on processing and first notified dates
+
+Of course, you can't process a claim before it is notified, right?
+
+```{python}
+claims_data.filter(f.col("PROCESSINGQUARTER") < f.col("FIRSTNOTIFIEDFYQUARTER")).count() / claims_data.count()
+```
+
+Say, what?
+
+> For the developments we use quarters and we just use the processing date data. But there is some nuance unfortunately. In the data provided to us (and you) the “ProcessingQuarter” is on a calendar year basis (for example, if a claim was processed in January 2020 this would appear in this column as 2020Q1). However, the UWY and first notified data are both on a financial year basis which runs April to March and by convention our current UWY is labelled as the year ending (i.e. we are currently in the 2026 UWY at NHBC). This means that when we’re building our triangles, we would treat the development quarter for a claim processed in Jan 2020 as 2020Q4.
+
+## Correcting Processing Quarters
+
+Let's make a function to convert to fiscal quarters. You will not have learnt how to make a user defined function on Snowflake from a python function yet so trust me or read up at:
+
+<https://docs.snowflake.com/en/developer-guide/snowpark/python/creating-udfs>
+
+```{python}
+
+from snowflake.snowpark.functions import udf
+from snowflake.snowpark.types import StringType
+
+## We NEED this set to declare and define the udf
+session.use_database("TEAM_SANDBOX")
+session.use_schema("ACTUARIAL_RESERVING")
+
+@udf(return_type=StringType(), session=session)
+def convert_calendar_to_fiscal_udf(calendar_quarter: str) -> str:
+    year, qtr = calendar_quarter.split('Q')
+    year = int(year)
+    qtr = int(qtr)
+
+    if qtr == 1:
+        fiscal_qtr = 4
+        fiscal_year = year
+    else:
+        fiscal_qtr = qtr - 1
+        fiscal_year = year + 1
+
+    return f"{fiscal_year}Q{fiscal_qtr}"
+```
+
+```{python}
+claims_data = (
+    claims_data
+    .with_column(
+        "ProcessingFYQuarter",
+        convert_calendar_to_fiscal_udf(f.col("PROCESSINGQUARTER"))
+    )
+)
+```
+
+```{python}
+claims_data.select("ProcessingQuarter", "ProcessingFYQuarter").sample(n = 50).to_pandas()
+```
+
+
+## Understand Reserving Segmentation Groups and exclude S4 claims
+
+Looking at the provided SQL query, we need to understand the Capped and Excess reserving segmentation groups.
+
+```{python}
+#! label: explore-variables
+claims_data.select("Period", "UWY").describe().show()
+
+claims_data.agg(
+    f.count_distinct("ReservingSegmentationGroup_Capped").alias("Capped group count"),
+    f.count_distinct("ReservingSegmentationGroup_Excess").alias("Excess group count")
+).to_pandas()
+```
+
+
+```{python}
+#| label: ReservingSegmentationGroup_Excess-distinct
+#| fig-cap: "Possible values for Excess segmentation groups"
+
+## Small tables, so from_pandas(X.to_pandas()) is fine
+
+excess_groups = pl.from_pandas(
+    (
+        claims_data
+        .filter(f.col("ReservingSegmentationGroup_Excess").is_not_null())
+        .group_by(f.col("ReservingSegmentationGroup_Excess").alias('"Groups"'))
+        .agg(
+            f.count("*").alias("n")
+        )
+        .sort("n", ascending=False)
+    ).to_pandas()
+)
+excess_groups
+```
+
+
+```{python}
+#| label: ReservingSegmentationGroup_Capped-distinct
+#| fig-cap: "Possible values for Capped segmentation groups"
+
+## Small tables, so from_pandas(X.to_pandas()) is fine.
+capped_groups = pl.from_pandas(
+    (
+        claims_data
+        .filter(f.col("ReservingSegmentationGroup_Capped").is_not_null())
+        .group_by(f.col("ReservingSegmentationGroup_Capped").alias('"Groups"'))
+        .agg(
+            f.count("*").alias("n")
+        )
+        .sort("n", ascending=False)
+    ).to_pandas()
+)
+capped_groups
+```
+
+### Exclude S4 claims
+
+**NOTE** that for our work we will exclude the 'S4' group. These are materially different claims that are dealt with separately.
+
+> We run an Excel triangle model for each segment excluding segment 11 – these are our S4 claims and don’t develop in a way that is appropriate to project using triangles.
+
+```{python}
+#| label: remove-s4
+
+claims_data = claims_data.filter(f.col("ReservingSegmentationGroup_Capped") != "S4")
+capped_groups = capped_groups.filter(pl.col("Groups") != "S4")
+capped_groups
+```
+
+
+## Investigate claims counts per underwriting year
+
+```{python}
+#| label: claims-volume-uwy
+claims_data_uwy = (
+    claims_data
+    .group_by("UWY")
+    .agg(
+        f.sum(f.col("ClaimCount")).alias('"ClaimCount"')
+    )
+    .sort("UWY")
+)
+
+px.bar(
+    claims_data_uwy,
+    x="UWY",
+    y="ClaimCount",
+    title="Claims per underwriting year",
+    text_auto=True
+)
+```
+
+Note that current reserving use data from 2000 but it looks like we could go back to 1980 at least.
+
+> \[The starting year is\] currently set to 2000 because that’s the number of rows our Excel models were set up with originally. We could look to go back further but this would require changes to our current process and we wouldn’t typically expect any development on underwriting years that old.
+
+## Processing quarters !?
+
+
+```{python}
+#| label: claims-volume-proc
+column = "PROCESSINGQUARTER"
+claims_data_proc = (
+    claims_data
+    .group_by(column)
+    .agg(
+        f.sum(f.col("ClaimCount")).alias('"ClaimCount"')
+    )
+    .sort(column)
+)
+
+px.bar(
+    claims_data_proc,
+    x=column,
+    y="ClaimCount",
+    title="Claims per processing",
+    text_auto=True
+)
+```
+
+What?
+
+### Evil hack alert
+
+```{python}
+#| label: evil-hack-fix-01
+
+claims_data = claims_data.filter(f.col("PROCESSINGQUARTER") < "2025Q3")
+```
+
+# Fiscal quarters to calendar dates
+
+You are using quarterly developments which means you need to read carefully and understand
+
+<https://github.com/casact/chainladder-python/discussions/545>
+
+We need to understand that underwriting year is just a year but for reserving we essentially assume that all underwriting happens on the first day of the fiscal year, ie 1 April.
+
+With this, we can now create columns in YYYY-MM-01 format for use with the chainladder package.
+
+First, we define a function:
+
+```{python}
+#| label: fiscal_quarter_to_date_udf
+
+from snowflake.snowpark.types import DateType
+from datetime import datetime
+
+@udf(name="fiscal_quarter_to_date", return_type=DateType(), input_types=[StringType()], session=session)
+def fiscal_quarter_to_date_udf(fq_str: str) -> datetime:
+    year, qtr = fq_str.split('Q')
+    year = int(year)
+    qtr = int(qtr)
+
+    if qtr == 1:
+        month = 4
+        year -= 1
+    elif qtr == 2:
+        month = 7
+        year -= 1
+    elif qtr == 3:
+        month = 10
+        year -= 1
+    elif qtr == 4:
+        month = 1
+        # year remains the same
+
+    return datetime(year, month, 1)
+
+```
+
+Second, we use that to create dates for first notified and processing date. At the same time, we remember to convert underwriting year to a date.
+
+```{python}
+#| label: convert-fiscal-quarter-to-date
+
+claims_data = (
+    claims_data
+    .with_columns(
+        ["FirstNotified", "Processing", "UWD"],
+        [
+            fiscal_quarter_to_date_udf(f.col("FirstNotifiedFYQuarter")),
+            fiscal_quarter_to_date_udf(f.col("ProcessingFYQuarter")),
+            f.date_from_parts(f.col("UWY") - 1, 4, 1)
+        ]
+    )
+)
+```
+
+Quick manual inspection:
+
+```{python}
+claims_data.select("FirstNotified", "FirstNotifiedFYQuarter", "Processing", "ProcessingFYQuarter", "UWD", "UWY").sample(n = 50).to_pandas()
+```
+
+Looking good!
+
+
+# Write function to get aggregated data as per SQL query
+
+We will write a function to get the same aggregated data as the SQL query, though we will of course use snowpark functions.
+
+- [Snowpark developer guide](https://docs.snowflake.com/en/developer-guide/snowpark/python/index)
+- [Snowpark API reference](https://docs.snowflake.com/developer-guide/snowpark/reference/python/latest/snowpark/index)
+
+```{python}
+#| label: get_aggregated_data
+def get_aggregated_data(category, uwy_start, seg_class):
+    """
+    Function to filter and aggregate claims data based on the given category, UWY start, and segmentation class.
+
+    Parameters:
+    - category (str): Either "Capped" or "Excess".
+    - uwy_start (int): The starting underwriting year.
+    - seg_class (str): The segmentation class.
+
+    Returns:
+    - aggregated_data: The filtered and aggregated claims data.
+    """
+    if category not in ["Capped", "Excess"]:
+        raise ValueError("Invalid category. Must be 'Capped' or 'Excess'.")
+
+    if category == "Capped":
+        if seg_class not in capped_groups["Groups"].to_list():
+            raise ValueError(f"Invalid segmentation class '{seg_class}' for category 'Capped'.")
+        filtered_data = (
+            claims_data
+            .filter((f.col("UWY") >= uwy_start) &
+                    (f.col("ReservingSegmentationGroup_Capped") == seg_class) &
+                    ((f.col("ValidityIndicator") == 'Y') |
+                     (f.col("Paid_Capped") != 0) |
+                     (f.col("CaseIncurred_Capped") != 0) |
+                     (f.col("BuilderRecs_Capped") != 0)))
+        )
+        aggregated_data = (
+            filtered_data
+            .group_by("ReservingSegmentationGroup_Capped", "UWD", "UWY",
+                      "FirstNotifiedFY", "FirstNotifiedFYHalfYear", "FirstNotifiedFYQuarter",
+                      "FirstNotified", "ProcessingFYQuarter",
+                      "FirstNotifiedMonth", "ProcessingHalfYear", "ProcessingQuarter", "ProcessingMonth", "Processing")
+            .agg(
+                f.sum("ClaimCount").alias("ClaimCount"),
+                f.sum("Paid_Capped").alias("Paid"),
+                f.sum("CaseIncurred_Capped").alias("Incurred"),
+                f.sum("BuilderRecs_Capped").alias("BuilderRecs")
+            )
+            .select(
+                f.col("ReservingSegmentationGroup_Capped").alias("ReservingSegmentationGroup"),
+                f.col("UWD"),
+                f.col("UWY"),
+                f.col("FirstNotified"),
+                f.col("FirstNotifiedFY"),
+                f.col("FirstNotifiedFYQuarter"),
+                f.col("Processing"),
+                f.col("ProcessingQuarter"),
+                f.col("ProcessingFYQuarter"),
+                f.col("ClaimCount"),
+                f.col("Paid"),
+                f.col("Incurred"),
+                f.col("BuilderRecs")
+            )
+        )
+    else:  # category == "Excess"
+        if seg_class not in excess_groups["Groups"].to_list():
+            raise ValueError(f"Invalid segmentation class '{seg_class}' for category 'Excess'.")
+        filtered_data = (
+            claims_data
+            .filter((f.col("UWY") >= uwy_start) &
+                    (f.col("ReservingSegmentationGroup_Excess") == seg_class) &
+                    ((f.col("ValidityIndicator") == 'Y') |
+                     (f.col("Paid_Excess") != 0) |
+                     (f.col("CaseIncurred_Excess") != 0) |
+                     (f.col("BuilderRecs_Excess") != 0)))
+        )
+        aggregated_data = (
+            filtered_data
+            .group_by("ReservingSegmentationGroup_Excess", "UWD", "UWY",
+                      "FirstNotifiedFY", "FirstNotifiedFYHalfYear", "FirstNotifiedFYQuarter",
+                      "FirstNotified", "ProcessingFYQuarter",
+                      "FirstNotifiedMonth", "ProcessingHalfYear", "ProcessingQuarter", "ProcessingMonth", "Processing")
+            .agg(
+                f.sum("ClaimCount_Excess").alias("ClaimCount"),
+                f.sum("Paid_Excess").alias("Paid"),
+                f.sum("CaseIncurred_Excess").alias("Incurred"),
+                f.sum("BuilderRecs_Excess").alias("BuilderRecs")
+            )
+            .select(
+                f.col("ReservingSegmentationGroup_Excess").alias('"ReservingSegmentationGroup"'),
+                f.col("UWD"),
+                f.col("UWY"),
+                f.col("FirstNotified"),
+                f.col("FirstNotifiedFY"),
+                f.col("FirstNotifiedFYQuarter"),
+                f.col("Processing"),
+                f.col("ProcessingQuarter"),
+                f.col("ProcessingFYQuarter"),
+                f.col("ClaimCount"),
+                f.col("Paid"),
+                f.col("Incurred"),
+                f.col("BuilderRecs")
+            )
+        )
+
+    return aggregated_data
+
+```
+
+
+## Simple function tests
+
+```{python}
+#| label: test1
+
+get_aggregated_data("Capped", 2000, "S3-H-L").count()
+get_aggregated_data("Capped", 2000, "S3-H-L").sample(n = 50).sort("UWY", "FIRSTNOTIFIEDFYQUARTER").to_pandas()
+```
+
+```{python}
+#| label: test-excess-1
+get_aggregated_data("Excess", 2000, "S2-Excess").sample(n = 50).sort("UWY", "FIRSTNOTIFIEDFYQUARTER").to_pandas()
+```
+
+```{python}
+#| label: test-excess-2
+get_aggregated_data("Excess", 2000, "S3-Excess").sample(n = 50).sort("UWY", "FIRSTNOTIFIEDFYQUARTER").to_pandas()
+
+```
+
+
+# ChainLadder package
+
+First make aure you have installed the package using `uv add chainladder` from the terminal. Then load it as `cl`.
+
+```{python}
+#| label: import-chainladder
+import chainladder as cl
+```
+
+We will be working with triangles and the user guide is here:
+
+<https://chainladder-python.readthedocs.io/en/latest/getting_started/tutorials/triangle-tutorial.html>
+
+
+## Creating the triangle
+
+Let's do one by hand first. 
+
+```{python}
+#| label: pick-group-triangle
+group = capped_groups[0, 'Groups']
+group
+```
+
+First pick one of Capped / Excess and then pick one of the groups from there. I select `Capped` and `{python} group`.
+
+Next, let's build the triangle data as in the previous exercise. Pick 2000 as the year.
+
+
+```{python}
+#| label: make-one-triangle
+aggregate_data = get_aggregated_data("Capped", 2000, group)
+triangle_data = (
+    aggregate_data
+    ## +++
+    ## Use this for annual data
+    .with_column(
+        "Processing", f.substr(f.col("ProcessingFYQuarter"), 1, 4)
+    )
+    .with_column(
+        "UWD", f.col("UWY").cast("string")
+    )
+    ## ---
+    .group_by("UWD", "Processing")
+    .agg(
+        f.sum("ClaimCount").alias("ClaimCount"),
+        f.sum("Paid").alias("Paid"),
+        f.sum("Incurred").alias("Incurred")
+    )
+    .sort(f.col("UWD"), f.col("Processing"))
+).to_pandas()
+triangle_data = pl.from_pandas(triangle_data).rename({
+    "CLAIMCOUNT": "ClaimCount",
+    "PAID": "Paid",
+    "INCURRED": "Incurred"
+})
+```
+
+```{python}
+triangle_data
+```
+
+
+### Incomplete data
+
+We need to deal with incomplete data for quarterly reserving.
+
+First, find the full grid:
+
+```{python}
+#| eval: false
+import datetime
+
+min_uwd = triangle_data.select(pl.col("UWD").min()).item()
+min_processing = triangle_data.select(pl.col("PROCESSING").min()).item()
+max_uwd = triangle_data.select(pl.col("UWD").max()).item()
+max_processing = triangle_data.select(pl.col("PROCESSING").max()).item()
+last_complete_quarter = datetime.date(2025, 4, 1) # XXX FIXME
+
+# Generate UWDs: annual on 1 April
+start_year = min_uwd.year
+end_year = max_uwd.year
+uwd_dates = [datetime.date(year, 4, 1) for year in range(start_year, end_year + 1)]
+uwd_df = pl.DataFrame({"UWD": uwd_dates})
+
+# Generate Processing dates: quarterly on 1 April
+start_date = min_processing
+end_date = max_processing # last_complete_quarter # max_processing
+
+processing_dates = []
+current = start_date
+while current <= end_date:
+    processing_dates.append(current)
+    month = current.month + 3
+    year = current.year + (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    current = datetime.date(year, month, 1)
+
+processing_df = pl.DataFrame({"PROCESSING": processing_dates})
+
+# Cartesian product and filter
+full_grid = uwd_df.join(processing_df, how="cross")
+valid_grid = full_grid.filter(pl.col("PROCESSING") >= pl.col("UWD"))
+```
+
+```{python}
+#| eval: false
+processing_df
+```
+
+```{python}
+#| eval: false
+# Ensure column names match
+
+# If triangle_data uses uppercase column names, rename them to match
+triangle_data = triangle_data.rename({
+    "CLAIMCOUNT": "ClaimCount",
+    "PAID": "Paid",
+    "INCURRED": "Incurred"
+})
+
+
+
+# Perform left join
+joined = valid_grid.join(
+    triangle_data,
+    on=["UWD", "PROCESSING"],
+    how="left"
+)
+```
+
+
+```{python}
+#| eval: false
+joined = (
+    joined
+    #.filter(pl.col("PROCESSING") <= last_complete_quarter)
+    .with_columns([
+        pl.col("ClaimCount").fill_null(0),
+        pl.col("Paid").fill_null(0.0),
+        pl.col("Incurred").fill_null(0.0)
+    ])
+)
+```
+
+
+Note: if you want cumulative:
+
+```python
+triangle_data = (
+    triangle_data
+    .sort(["UWD", "PROCESSING"])
+    .with_columns([
+        pl.col("INCURRED").cum_sum().over("UWD").alias("CUMULATIVE_INCURRED"),
+        pl.col("PAID").cum_sum().over("UWD").alias("CUMULATIVE_PAID"),
+        pl.col("CLAIMCOUNT").cum_sum().over("UWD").alias("CUMULATIVE_CLAIMCOUNT"),
+    ])
+)
+triangle_data.write_excel("long-triangle.xlsx")
+triangle_data
+```
+
+### Now make the triangle
+
+Time to bring in chainladder:
+
+
+```{python}
+#| label: cl_triangle
+
+cl_triangle = cl.Triangle(
+    #data=joined,
+    data=triangle_data,
+    origin="UWD",
+    origin_format="yyyy-mm-dd",
+    development="PROCESSING",
+    development_format="yyyy-mm-dd",
+    columns=["Paid", "Incurred", "ClaimCount"],
+    cumulative=False
+)
+cl_triangle
+```
+
+```{python}
+triangle_dt = cl.Pipeline(
+    [("dev", cl.Development()), ("tail", cl.TailCurve())]
+).fit_transform(cl_triangle)
+```
+
+
+```{python}
+cl_triangle["Incurred"].development
+```
+
+
+```{python}
+cl_triangle_cum = cl_triangle.incr_to_cum()
+cl_triangle_cum["Incurred"].latest_diagonal
+```
+
+```{python}
+triangle_dt["Incurred"].incr_to_cum().latest_diagonal
+```
+
+```{python}
+cl_triangle.plot()
+```
+
+```{python}
+triangle_dt.plot()
+```
+
+```{python}
+print("\nChainladder object:\n", cl_triangle)
+```
+
+```{python}
+print("\nIncurred Leading diagonal:\n", cl_triangle["Incurred"].latest_diagonal)
+```
+
+
+```{python}
+print("\nIncurred development factors:\n", cl_triangle["Incurred"].link_ratio)
+```
+
+```{python}
+model = cl.Chainladder().fit(cl_triangle)
+```
+
+```{python}
+print("\nLDF Factors:\n", model.cdf_["Incurred"])
+```
+
+```{python}
+print("\nBCL Incurred Ultimate:\n", model.ultimate_["Incurred"])
+```
+
+```{python}
+print("\nBCL Paid Ultimate:\n", model.ultimate_["Paid"])
+```
+
+```{python}
+print("\nClaimCount Leading diagonal:\n", cl_triangle["ClaimCount"].latest_diagonal)
+```
+
+```{python}
+bf_model = (
+    cl.BornhuetterFerguson(apriori=0.458)
+    .fit(cl_triangle, sample_weight=cl_triangle["ClaimCount"].latest_diagonal)
+)
+bf_model
+```
+
+```{python}
+bf_model.ultimate_["Incurred"]
+```
+
+```{.python}
+cl.options.set_option('ULT_VAL', '2050-12-31 23:59:59.999999999')
+
+df_data = pd.read_excel(r"\\bw-wan\efs\ILC\NonClient\Tools\Python\TrigData.xlsx", "LongForm")
+cl_trig = cl.Triangle(data=df_data, 
+                      origin="origin_year", 
+                      development="development_year", 
+                      columns=["paid", "incurred", "premium"],
+                      cumulative=True)
+
+print("\nInput data frame:\n", df_data.head(30))
+print("\nChainladder object:\n", cl_trig)
+print("\nIncurred Leading diagonal:\n", cl_trig["incurred"].latest_diagonal)
+print("\nIncurred development factors:\n", cl_trig["incurred"].link_ratio)
+model = cl.Chainladder().fit(cl_trig)
+
+print("\nLDF Factors:\n", model.cdf_["incurred"])
+print("\nBCL Incurred Ultimate:\n", model.ultimate_["incurred"])
+print("\nBCL Paid Ultimate:\n", model.ultimate_["paid"])
+
+bf_example = cl.BornhuetterFerguson(apriori=0.458).fit(cl_trig, sample_weight=cl_trig["premium"].latest_diagonal)
+print("\nBF Incurred Ultimate:\n", bf_example.ultimate_["incurred"])
+```
+
+
+# Memory
+
+
+```{python}
+from pympler import muppy, summary
+
+# Get all objects in memory
+all_objects = muppy.get_objects()
+
+# Summarise memory usage
+sum_obj = summary.summarize(all_objects)
+
+# Print top memory consumers
+summary.print_(sum_obj)
+
+```

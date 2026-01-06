@@ -1,0 +1,46 @@
+
+# run in termnial
+#%%
+uv add ipython
+uv add ipykernel
+uv add plotly
+uv add polars
+uv add pandas
+uv add numpy
+uv add plotly
+uv add snowflake
+uv add snowflake.snowpark
+uv pip install snowflake-snowpark-python
+uv add itables
+uv add chainladder
+
+# Quarto document: create code cell
+# Ctrl + Shift + I
+
+
+#%%
+import plotly.express as px
+import plotly.graph_objects as go
+import polars as pl
+import pandas as pd
+
+
+#%%
+import polars as pl
+from snowflake.snowpark import Session
+import snowflake.snowpark.functions as f
+import plotly.express as px
+
+## For working with Quarto documents
+from IPython.display import Markdown
+import itables
+itables.init_notebook_mode()
+
+###############################################################################
+
+#%%
+session = Session.builder.configs({
+    "connection_name": "workbench",
+    "warehouse": "ACTUARIAL_PRICING_WH"
+}).create()
+# %%
