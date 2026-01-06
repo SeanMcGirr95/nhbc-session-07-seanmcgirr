@@ -1,0 +1,119 @@
+---
+title: "NHBC Reserving Example"
+format:
+  html:
+    code-fold: show
+    code-tools: true
+    number-sections: true
+    toc: true
+    toc-location: body
+    title-block-banner: true
+---
+
+```{python}
+import polars as pl
+from snowflake.snowpark import Session
+import snowflake.snowpark.functions as f
+import plotly.express as px
+import chainladder as cl
+
+
+## For working with Quarto documents
+from IPython.display import Markdown
+import itables
+itables.init_notebook_mode()
+```
+
+```{python}
+session = Session.builder.config("connection_name", "workbench").create()
+claims_data = session.table("TEAM_SANDBOX.ACTUARIAL_RESERVING.CLAIMSDATA")
+```
+
+
+```{python}
+latest_period_value = (
+    claims_data
+    .select(f.max(f.col("PERIOD")).alias("LATEST_PERIOD"))
+    .collect()[0]["LATEST_PERIOD"]
+)
+latest_period_value
+```
+
+
+```{python}
+latest_claims = claims_data.filter((f.col("PERIOD") == latest_period_value) & (f.col("ISEXCLUDEDRESERVING") == 0))
+latest_claims.show()
+print("Filtered Claims by latest period:", latest_claims.count()
+```
+
+
+```{python}
+f_latest_claims = last_claims.select("PERIOD", "ISEXCLUDEDRESERVING", "PROCESSINGQUARTER", "FIRSTNOTIFIEDFYQUARTER").show()
+```
+
+
+```{python}
+
+checks = (
+    latest_claims
+    .filter(f.col("PROCESSINGQUARTER") < (f.col("FIRSTNOTIFIEDFYQUARTER")))
+    .count() / latest_claims.count()
+)
+
+print("Rows where processingquarter < firstnotifiedfyquarter:", checks)
+```
+
+```{python}
+
+from snowflake.snowpark.functions import udf
+from snowflake.snowpark.types import StringType
+
+## We NEED this set to declare and define the udf
+session.use_database("TEAM_SANDBOX")
+session.use_schema("ACTUARIAL_RESERVING")
+
+@udf(return_type=StringType(), session=session)
+def convert_calendar_to_fiscal_udf(calendar_quarter: str) -> str:
+
+    if calendar_quarter is None:
+        return None
+
+    s = calendar_quarter.strip()
+    if len(s) != 6 or s[4] != 'Q':
+        return None
+
+    try:
+        y = int(s[:4])
+        q = int(s[-1])
+    except Exception:
+        return None
+
+    if q not in (1, 2, 3, 4):
+        return None
+
+    if q == 1:            # Jan–Mar
+        fiscal_year = y
+        fiscal_qtr = 4
+    elif q == 2:          # Apr–Jun
+        fiscal_year = y + 1
+        fiscal_qtr = 1
+    elif q == 3:          # Jul–Sep
+        fiscal_year = y + 1
+        fiscal_qtr = 2
+    else:                 # Oct–Dec
+        fiscal_year = y + 1
+        fiscal_qtr = 3
+    return f"{fiscal_year}Q{fiscal_qtr}"
+
+claims_data = (
+    claims_data
+    .with_column(
+        "ProcessingFYQuarter",
+        convert_calendar_to_fiscal_udf(f.col("PROCESSINGQUARTER"))
+    )
+)
+
+claims_data.select("ProcessingQuarter", "ProcessingFYQuarter").sample(n = 50).to_pandas()
+
+
+```

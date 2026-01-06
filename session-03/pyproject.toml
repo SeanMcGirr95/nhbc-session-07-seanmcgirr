@@ -1,0 +1,16 @@
+[project]
+name = "session-03"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ipykernel>=7.0.1",
+    "pandas>=2.3.3",
+    "plotly[express]>=6.3.1",
+    "polars[calamine]>=1.34.0",
+    "pyarrow>=21.0.0",
+    "snowflake-connector-python>=4.0.0",
+    "snowflake-sqlalchemy>=1.1.18",
+    "xlsxwriter>=3.2.9",
+]
